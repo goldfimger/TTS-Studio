@@ -27,6 +27,17 @@ data class SavedAudioFile(
 object MediaStoreSaver {
 
     private const val FILE_PREFIX = "gemini_voice_studio_"
+    private const val EDITED_PREFIX = "edited_"
+
+    fun buildEditedFileName(originalName: String): String {
+        val clean = originalName.trim().ifEmpty { "${FILE_PREFIX}${System.currentTimeMillis()}.wav" }
+        return "${EDITED_PREFIX}$clean"
+    }
+
+    private fun isArtifactWavFile(name: String): Boolean {
+        val matchesPrefix = name.startsWith(FILE_PREFIX) || name.startsWith(EDITED_PREFIX)
+        return matchesPrefix && name.endsWith(".wav", ignoreCase = true)
+    }
 
     fun extractFolderLabel(treeUri: Uri): String {
         return runCatching {
@@ -34,6 +45,29 @@ object MediaStoreSaver {
             val cleaned = docId.substringAfter(':', docId).trim('/')
             cleaned.ifEmpty { "Folder Terpilih" }
         }.getOrDefault("Folder Terpilih")
+    }
+
+    suspend fun saveEditedWav(
+        context: Context,
+        pcmOrWavBytes: ByteArray,
+        originalFileName: String,
+        targetDirectory: String,
+        treeUriString: String = "",
+        folderLabel: String = "Downloads/GeminiVoiceStudio",
+        sampleRate: Int = WavAudioUtils.DEFAULT_SAMPLE_RATE
+    ): Result<String> {
+        val editedName = buildEditedFileName(originalFileName)
+        return saveWavInternal(
+            context = context,
+            rawOrWavBytes = pcmOrWavBytes,
+            mimeType = "audio/wav;rate=$sampleRate",
+            fileName = editedName,
+            targetDirectory = targetDirectory,
+            treeUriString = treeUriString,
+            folderLabel = folderLabel,
+            sampleRateOverride = sampleRate,
+            onProgress = {}
+        )
     }
 
     suspend fun saveWavToDirectory(
@@ -45,13 +79,37 @@ object MediaStoreSaver {
         folderLabel: String = "Downloads/GeminiVoiceStudio",
         sampleRateOverride: Int = WavAudioUtils.DEFAULT_SAMPLE_RATE,
         onProgress: (Int) -> Unit = {}
+    ): Result<String> {
+        val fileName = "${FILE_PREFIX}${System.currentTimeMillis()}.wav"
+        return saveWavInternal(
+            context = context,
+            rawOrWavBytes = rawOrWavBytes,
+            mimeType = mimeType,
+            fileName = fileName,
+            targetDirectory = targetDirectory,
+            treeUriString = treeUriString,
+            folderLabel = folderLabel,
+            sampleRateOverride = sampleRateOverride,
+            onProgress = onProgress
+        )
+    }
+
+    private suspend fun saveWavInternal(
+        context: Context,
+        rawOrWavBytes: ByteArray,
+        mimeType: String,
+        fileName: String,
+        targetDirectory: String,
+        treeUriString: String = "",
+        folderLabel: String = "Downloads/GeminiVoiceStudio",
+        sampleRateOverride: Int = WavAudioUtils.DEFAULT_SAMPLE_RATE,
+        onProgress: (Int) -> Unit = {}
     ): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
             onProgress(0)
             val detectedRate = WavAudioUtils.parseSampleRate(mimeType)
             val sampleRate = if (detectedRate > 0) detectedRate else sampleRateOverride
             val wavBytes = WavAudioUtils.ensureWavBytes(rawOrWavBytes, sampleRate)
-            val fileName = "${FILE_PREFIX}${System.currentTimeMillis()}.wav"
 
             if (treeUriString.isNotBlank()) {
                 val resolver = context.contentResolver
@@ -177,7 +235,7 @@ object MediaStoreSaver {
                     while (cursor.moveToNext()) {
                         val docId = if (idCol >= 0) cursor.getString(idCol) else continue
                         val name = if (nameCol >= 0) cursor.getString(nameCol) else continue
-                        if (!name.startsWith(FILE_PREFIX) || !name.endsWith(".wav", ignoreCase = true)) continue
+                        if (!isArtifactWavFile(name)) continue
                         val size = if (sizeCol >= 0) cursor.getLong(sizeCol) else 0L
                         val modMillis = if (modCol >= 0) cursor.getLong(modCol) else System.currentTimeMillis()
                         val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
@@ -212,8 +270,8 @@ object MediaStoreSaver {
                 MediaStore.MediaColumns.SIZE,
                 MediaStore.MediaColumns.DATE_ADDED
             )
-            val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?"
-            val selectionArgs = arrayOf("${FILE_PREFIX}%.wav")
+            val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ? OR ${MediaStore.MediaColumns.DISPLAY_NAME} LIKE ?"
+            val selectionArgs = arrayOf("${FILE_PREFIX}%.wav", "${EDITED_PREFIX}%.wav")
             val sortOrder = "${MediaStore.MediaColumns.DATE_ADDED} DESC"
 
             for (collectionUri in uris) {
@@ -260,7 +318,7 @@ object MediaStoreSaver {
                 Environment.DIRECTORY_DOWNLOADS
             )
             downloadsDir.listFiles { file ->
-                file.isFile && file.name.startsWith(FILE_PREFIX) && file.name.endsWith(".wav")
+                file.isFile && isArtifactWavFile(file.name)
             }?.sortedByDescending { it.lastModified() }?.forEach { file ->
                 val size = file.length()
                 val pcmBytes = (size - 44L).coerceAtLeast(0L)

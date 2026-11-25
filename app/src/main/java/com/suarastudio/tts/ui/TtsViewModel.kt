@@ -9,6 +9,7 @@ import com.suarastudio.tts.audio.MediaStoreSaver
 import com.suarastudio.tts.audio.PcmAudioPlayer
 import com.suarastudio.tts.audio.PlaybackState
 import com.suarastudio.tts.audio.SavedAudioFile
+import com.suarastudio.tts.audio.WavAudioUtils
 import com.suarastudio.tts.data.GeminiQuotaException
 import com.suarastudio.tts.data.GeminiTtsClient
 import com.suarastudio.tts.data.GeminiVoice
@@ -17,6 +18,7 @@ import com.suarastudio.tts.data.TtsMode
 import com.suarastudio.tts.data.TtsResult
 import com.suarastudio.tts.data.UserSettings
 import com.suarastudio.tts.ui.theme.ThemeMode
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -62,6 +64,20 @@ enum class AppTab(val label: String) {
 }
 
 @Immutable
+data class AudioEditorState(
+    val targetFile: SavedAudioFile,
+    val currentPcm: ByteArray,
+    val waveformBars: List<Float>,
+    val sampleRate: Int = WavAudioUtils.DEFAULT_SAMPLE_RATE,
+    val durationMs: Long = 0L,
+    val undoCount: Int = 0,
+    val redoCount: Int = 0,
+    val isPreviewPlaying: Boolean = false,
+    val isSaving: Boolean = false,
+    val showSaveConfirm: Boolean = false
+)
+
+@Immutable
 data class TtsUiState(
     val activeTab: AppTab = AppTab.PROJEK,
     val isMultiSpeaker: Boolean = false,
@@ -88,7 +104,8 @@ data class TtsUiState(
     val isLogSheetOpen: Boolean = false,
     val apiLogs: List<ApiLogEntry> = emptyList(),
     val detectedGeminiSummary: String = "",
-    val allGeminiModelsCount: Int = 0
+    val allGeminiModelsCount: Int = 0,
+    val audioEditor: AudioEditorState? = null
 )
 
 class TtsViewModel(application: Application) : AndroidViewModel(application) {
@@ -114,6 +131,9 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
     private var lastAudioResult: TtsResult? = null
     private var lastDetectedKey: String? = null
     private val previewCache = mutableMapOf<String, TtsResult>()
+    private var previewJob: Job? = null
+    private val editorUndoStack = ArrayDeque<ByteArray>()
+    private val editorRedoStack = ArrayDeque<ByteArray>()
 
     init {
         viewModelScope.launch {
@@ -482,11 +502,19 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
         }
         val endpointPath = "/${currentSettings.apiVersion}/models/$effectiveModel:generateContent"
 
+        // Ensure any active preview or older audio clip never bleeds into the newly generated result
+        previewJob?.cancel()
+        previewJob = null
+        audioPlayer.stop()
+        lastAudioResult = null
+
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     isGenerating = true,
                     activeSavedUri = null,
+                    previewingKey = null,
+                    isPreviewLoading = false,
                     isDownloadDone = false,
                     downloadProgress = null
                 )
@@ -556,6 +584,8 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun stopPreview() {
+        previewJob?.cancel()
+        previewJob = null
         audioPlayer.stop()
         _uiState.update { it.copy(previewingKey = null, isPreviewLoading = false) }
     }
@@ -603,6 +633,7 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
         styleInstruction: String,
         sampleText: String
     ) {
+        if (_uiState.value.isGenerating) return
         val currentSettings = settings.value
         if (currentSettings.apiKey.isBlank()) {
             _snackbarMessage.tryEmit("Masukkan Gemini API Key di Pengaturan untuk preview suara.")
@@ -612,6 +643,7 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
         val cacheKey = "${currentSettings.modelId}|$previewKey|${voice.voiceName}|$styleInstruction"
         val endpointPath = "/${currentSettings.apiVersion}/models/${currentSettings.modelId}:generateContent"
         previewCache[cacheKey]?.let { cached ->
+            previewJob?.cancel()
             audioPlayer.stop()
             _uiState.update {
                 it.copy(
@@ -632,7 +664,8 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        viewModelScope.launch {
+        previewJob?.cancel()
+        previewJob = viewModelScope.launch {
             audioPlayer.stop()
             _uiState.update {
                 it.copy(
@@ -812,6 +845,209 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
                     _snackbarMessage.tryEmit("Gagal menghapus: ${err.message}")
                 }
         }
+    }
+
+    fun openAudioEditor(file: SavedAudioFile) {
+        viewModelScope.launch {
+            audioPlayer.stop()
+            _uiState.update { it.copy(activeSavedUri = null, previewingKey = null, isPreviewLoading = false) }
+            MediaStoreSaver.readAudioBytes(getApplication(), file.uri)
+                .onSuccess { wavBytes ->
+                    val pcm = WavAudioUtils.extractPcmPayload(wavBytes)
+                    if (pcm.isEmpty()) {
+                        _snackbarMessage.tryEmit("Audio kosong dan tidak dapat diedit.")
+                        return@onSuccess
+                    }
+                    val sr = settings.value.sampleRateHz.takeIf { it > 0 } ?: WavAudioUtils.DEFAULT_SAMPLE_RATE
+                    editorUndoStack.clear()
+                    editorRedoStack.clear()
+                    _uiState.update {
+                        it.copy(
+                            audioEditor = AudioEditorState(
+                                targetFile = file,
+                                currentPcm = pcm,
+                                waveformBars = WavAudioUtils.computeWaveformBars(pcm),
+                                sampleRate = sr,
+                                durationMs = WavAudioUtils.durationMs(pcm, sr),
+                                undoCount = 0,
+                                redoCount = 0,
+                                isPreviewPlaying = false,
+                                isSaving = false,
+                                showSaveConfirm = false
+                            )
+                        )
+                    }
+                }
+                .onFailure { err ->
+                    _snackbarMessage.tryEmit("Gagal membuka audio editor: ${err.message}")
+                }
+        }
+    }
+
+    fun trimEditorAudio(startFraction: Float, endFraction: Float) {
+        val editor = _uiState.value.audioEditor ?: return
+        val nextPcm = WavAudioUtils.trimPcm(editor.currentPcm, startFraction, endFraction, editor.sampleRate)
+        if (nextPcm.size < 400) {
+            _snackbarMessage.tryEmit("Bagian hasil trim terlalu pendek.")
+            return
+        }
+        audioPlayer.stop()
+        editorUndoStack.addLast(editor.currentPcm)
+        editorRedoStack.clear()
+        _uiState.update {
+            it.copy(
+                audioEditor = editor.copy(
+                    currentPcm = nextPcm,
+                    waveformBars = WavAudioUtils.computeWaveformBars(nextPcm),
+                    durationMs = WavAudioUtils.durationMs(nextPcm, editor.sampleRate),
+                    undoCount = editorUndoStack.size,
+                    redoCount = 0,
+                    isPreviewPlaying = false,
+                    showSaveConfirm = false
+                )
+            )
+        }
+    }
+
+    fun cutEditorAudio(startFraction: Float, endFraction: Float) {
+        val editor = _uiState.value.audioEditor ?: return
+        val nextPcm = WavAudioUtils.cutPcm(editor.currentPcm, startFraction, endFraction, editor.sampleRate)
+        if (nextPcm.size < 400) {
+            _snackbarMessage.tryEmit("Tidak dapat memotong seluruh audio.")
+            return
+        }
+        audioPlayer.stop()
+        editorUndoStack.addLast(editor.currentPcm)
+        editorRedoStack.clear()
+        _uiState.update {
+            it.copy(
+                audioEditor = editor.copy(
+                    currentPcm = nextPcm,
+                    waveformBars = WavAudioUtils.computeWaveformBars(nextPcm),
+                    durationMs = WavAudioUtils.durationMs(nextPcm, editor.sampleRate),
+                    undoCount = editorUndoStack.size,
+                    redoCount = 0,
+                    isPreviewPlaying = false,
+                    showSaveConfirm = false
+                )
+            )
+        }
+    }
+
+    fun undoEditorAudio() {
+        val editor = _uiState.value.audioEditor ?: return
+        if (editorUndoStack.isEmpty()) return
+        audioPlayer.stop()
+        val previous = editorUndoStack.removeLast()
+        editorRedoStack.addLast(editor.currentPcm)
+        _uiState.update {
+            it.copy(
+                audioEditor = editor.copy(
+                    currentPcm = previous,
+                    waveformBars = WavAudioUtils.computeWaveformBars(previous),
+                    durationMs = WavAudioUtils.durationMs(previous, editor.sampleRate),
+                    undoCount = editorUndoStack.size,
+                    redoCount = editorRedoStack.size,
+                    isPreviewPlaying = false,
+                    showSaveConfirm = false
+                )
+            )
+        }
+    }
+
+    fun redoEditorAudio() {
+        val editor = _uiState.value.audioEditor ?: return
+        if (editorRedoStack.isEmpty()) return
+        audioPlayer.stop()
+        val next = editorRedoStack.removeLast()
+        editorUndoStack.addLast(editor.currentPcm)
+        _uiState.update {
+            it.copy(
+                audioEditor = editor.copy(
+                    currentPcm = next,
+                    waveformBars = WavAudioUtils.computeWaveformBars(next),
+                    durationMs = WavAudioUtils.durationMs(next, editor.sampleRate),
+                    undoCount = editorUndoStack.size,
+                    redoCount = editorRedoStack.size,
+                    isPreviewPlaying = false,
+                    showSaveConfirm = false
+                )
+            )
+        }
+    }
+
+    fun toggleEditorPlayback() {
+        val editor = _uiState.value.audioEditor ?: return
+        if (playbackState.value.isPlaying) {
+            audioPlayer.pause()
+        } else {
+            audioPlayer.loadAndPlay(editor.currentPcm, "audio/L16;rate=${editor.sampleRate}")
+        }
+    }
+
+    fun requestSaveEditor() {
+        val editor = _uiState.value.audioEditor ?: return
+        audioPlayer.stop()
+        _uiState.update {
+            it.copy(audioEditor = editor.copy(showSaveConfirm = true, isPreviewPlaying = false))
+        }
+    }
+
+    fun dismissSaveEditorConfirm() {
+        val editor = _uiState.value.audioEditor ?: return
+        _uiState.update {
+            it.copy(audioEditor = editor.copy(showSaveConfirm = false))
+        }
+    }
+
+    fun confirmSaveEditedAudio() {
+        val editor = _uiState.value.audioEditor ?: return
+        if (editor.isSaving) return
+        val currentSettings = settings.value
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(audioEditor = editor.copy(isSaving = true))
+            }
+            val res = MediaStoreSaver.saveEditedWav(
+                context = getApplication(),
+                pcmOrWavBytes = editor.currentPcm,
+                originalFileName = editor.targetFile.displayName,
+                targetDirectory = currentSettings.downloadDirectory,
+                treeUriString = currentSettings.downloadTreeUri,
+                folderLabel = currentSettings.downloadFolderLabel,
+                sampleRate = editor.sampleRate
+            )
+            res.onSuccess { savedPath ->
+                val editedName = MediaStoreSaver.buildEditedFileName(editor.targetFile.displayName)
+                appendApiLog(
+                    method = "EXPORT",
+                    endpoint = savedPath,
+                    statusCode = null,
+                    level = ApiLogLevel.SUCCESS,
+                    actionLabel = "Simpan Audio Editan",
+                    detail = "Audio editan disimpan sebagai $editedName."
+                )
+                editorUndoStack.clear()
+                editorRedoStack.clear()
+                audioPlayer.stop()
+                _uiState.update { it.copy(audioEditor = null) }
+                _snackbarMessage.tryEmit("Disimpan sebagai $editedName")
+                refreshSavedFiles(currentSettings)
+            }.onFailure { err ->
+                _uiState.update {
+                    it.copy(audioEditor = editor.copy(isSaving = false, showSaveConfirm = false))
+                }
+                _snackbarMessage.tryEmit("Gagal menyimpan audio editan: ${err.message}")
+            }
+        }
+    }
+
+    fun discardAndCloseEditor() {
+        audioPlayer.stop()
+        editorUndoStack.clear()
+        editorRedoStack.clear()
+        _uiState.update { it.copy(audioEditor = null) }
     }
 
     override fun onCleared() {

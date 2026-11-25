@@ -1,25 +1,36 @@
 package com.suarastudio.tts.ui
 
 import android.content.Intent
+import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
@@ -40,6 +51,7 @@ import androidx.compose.material.icons.rounded.RecordVoiceOver
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.UploadFile
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -70,16 +82,19 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Velocity
@@ -88,6 +103,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.suarastudio.tts.data.GeminiVoice
 import com.suarastudio.tts.ui.theme.ThemeMode
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.text.NumberFormat
 import java.util.Locale
 
@@ -127,6 +144,11 @@ private val AI_STUDIO_STYLE_PRESETS = listOf(
         title = "The Ads Voiceover",
         instruction = "Deliver with high energy, crisp articulation, and persuasive commercial voiceover punch",
         sampleText = "Rasakan suara jernih berkualitas studio hanya dalam satu sentuhan, sekarang juga!"
+    ),
+    StylePreset(
+        title = "Playful Commercial Suspense",
+        instruction = "Peppy, bright, and playful commercial voiceover hooking the listener with curious suspense",
+        sampleText = "Pernahkah Anda membayangkan rahasia di balik suara sehalus studio... tepat dari genggaman Anda?"
     ),
     StylePreset(
         title = "The Training Guide",
@@ -206,7 +228,11 @@ private enum class VoicePickerTarget {
     SPEAKER_2
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(
+    ExperimentalMaterial3Api::class,
+    ExperimentalLayoutApi::class,
+    ExperimentalFoundationApi::class
+)
 @Composable
 fun TtsPlaygroundScreen(viewModel: TtsViewModel) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -214,9 +240,22 @@ fun TtsPlaygroundScreen(viewModel: TtsViewModel) {
     val playbackState by viewModel.playbackState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
+    val uiScope = rememberCoroutineScope()
+    val scriptBringIntoView = remember { BringIntoViewRequester() }
 
     var voicePickerTarget by remember { mutableStateOf<VoicePickerTarget?>(null) }
     var isStyleSheetOpen by remember { mutableStateOf(false) }
+    var isScriptFocused by remember { mutableStateOf(false) }
+    val imeVisible = WindowInsets.isImeVisible
+    var wasImeVisible by remember { mutableStateOf(false) }
+
+    LaunchedEffect(imeVisible) {
+        if (wasImeVisible && !imeVisible && isScriptFocused) {
+            focusManager.clearFocus()
+        }
+        wasImeVisible = imeVisible
+    }
 
     val folderPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
@@ -227,6 +266,46 @@ fun TtsPlaygroundScreen(viewModel: TtsViewModel) {
                 context.contentResolver.takePersistableUriPermission(uri, flags)
             }
             viewModel.updateDownloadFolder(uri)
+        }
+    }
+
+    val scriptFilePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            uiScope.launch {
+                val fileName = runCatching {
+                    context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                        val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (c.moveToFirst() && idx >= 0) c.getString(idx) else null
+                    }
+                }.getOrNull() ?: uri.lastPathSegment.orEmpty().substringAfterLast('/')
+
+                val mime = context.contentResolver.getType(uri).orEmpty()
+                val lowerName = fileName.lowercase(Locale.US)
+                val isSupported = lowerName.endsWith(".txt") ||
+                    lowerName.endsWith(".md") ||
+                    lowerName.endsWith(".markdown") ||
+                    mime.startsWith("text/")
+
+                if (!isSupported) {
+                    snackbarHostState.showSnackbar("Pilih file teks berformat .txt atau .md.")
+                    return@launch
+                }
+
+                val textResult = runCatching {
+                    context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use {
+                        it.readText().removePrefix("\uFEFF")
+                    } ?: error("Tidak dapat membaca isi file.")
+                }
+
+                textResult.onSuccess { importedText ->
+                    viewModel.updateScriptText(importedText)
+                    snackbarHostState.showSnackbar("Naskah diimpor: ${fileName.ifEmpty { "file teks" }}")
+                }.onFailure { err ->
+                    snackbarHostState.showSnackbar("Gagal mengimpor naskah: ${err.message}")
+                }
+            }
         }
     }
 
@@ -317,52 +396,67 @@ fun TtsPlaygroundScreen(viewModel: TtsViewModel) {
         },
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         bottomBar = {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                if (uiState.activeTab == AppTab.PROJEK) {
-                    AudioPlayerBar(
-                        playbackState = playbackState,
-                        isSavingWav = uiState.isSavingWav,
-                        downloadProgress = uiState.downloadProgress,
-                        isDownloadDone = uiState.isDownloadDone,
-                        onTogglePlayPause = viewModel::togglePlayPause,
-                        onStop = viewModel::stopPlayback,
-                        onSeek = viewModel::seekTo,
-                        onSaveWav = viewModel::saveWavToDownloads
-                    )
-                }
-                NavigationBar {
-                    NavigationBarItem(
-                        selected = uiState.activeTab == AppTab.PROJEK,
-                        onClick = { viewModel.selectTab(AppTab.PROJEK) },
-                        icon = { Icon(Icons.Rounded.Folder, contentDescription = null) },
-                        label = { Text(AppTab.PROJEK.label) }
-                    )
-                    NavigationBarItem(
-                        selected = uiState.activeTab == AppTab.ARTIFACTS,
-                        onClick = { viewModel.selectTab(AppTab.ARTIFACTS) },
-                        icon = { Icon(Icons.Rounded.LibraryMusic, contentDescription = null) },
-                        label = { Text(AppTab.ARTIFACTS.label) }
-                    )
-                    NavigationBarItem(
-                        selected = uiState.activeTab == AppTab.TENTANG,
-                        onClick = { viewModel.selectTab(AppTab.TENTANG) },
-                        icon = { Icon(Icons.Rounded.Info, contentDescription = null) },
-                        label = { Text(AppTab.TENTANG.label) }
-                    )
+            if (!(isScriptFocused && imeVisible && uiState.activeTab == AppTab.PROJEK)) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    if (uiState.activeTab == AppTab.PROJEK) {
+                        AudioPlayerBar(
+                            playbackState = playbackState,
+                            isSavingWav = uiState.isSavingWav,
+                            downloadProgress = uiState.downloadProgress,
+                            isDownloadDone = uiState.isDownloadDone,
+                            onTogglePlayPause = viewModel::togglePlayPause,
+                            onStop = viewModel::stopPlayback,
+                            onSeek = viewModel::seekTo,
+                            onSaveWav = viewModel::saveWavToDownloads
+                        )
+                    }
+                    NavigationBar {
+                        NavigationBarItem(
+                            selected = uiState.activeTab == AppTab.PROJEK,
+                            onClick = { viewModel.selectTab(AppTab.PROJEK) },
+                            icon = { Icon(Icons.Rounded.Folder, contentDescription = null) },
+                            label = { Text(AppTab.PROJEK.label) }
+                        )
+                        NavigationBarItem(
+                            selected = uiState.activeTab == AppTab.ARTIFACTS,
+                            onClick = { viewModel.selectTab(AppTab.ARTIFACTS) },
+                            icon = { Icon(Icons.Rounded.LibraryMusic, contentDescription = null) },
+                            label = { Text(AppTab.ARTIFACTS.label) }
+                        )
+                        NavigationBarItem(
+                            selected = uiState.activeTab == AppTab.TENTANG,
+                            onClick = { viewModel.selectTab(AppTab.TENTANG) },
+                            icon = { Icon(Icons.Rounded.Info, contentDescription = null) },
+                            label = { Text(AppTab.TENTANG.label) }
+                        )
+                    }
                 }
             }
         }
     ) { innerPadding ->
         when (uiState.activeTab) {
             AppTab.PROJEK -> {
-                Column(
+                BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(innerPadding)
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 16.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                        .imePadding()
                 ) {
+                    val maxExpandedScriptHeight = (maxHeight - 20.dp).coerceAtLeast(176.dp)
+                    LaunchedEffect(isScriptFocused, uiState.scriptText.length, maxExpandedScriptHeight) {
+                        if (isScriptFocused) {
+                            delay(60)
+                            scriptBringIntoView.bringIntoView()
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
                     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                         SegmentedButton(
                             selected = !uiState.isMultiSpeaker,
@@ -527,24 +621,67 @@ fun TtsPlaygroundScreen(viewModel: TtsViewModel) {
                         }
                     }
 
-                    // Fixed-height isolated scrollable script text box (only inner text scrolls)
-                    OutlinedTextField(
-                        value = uiState.scriptText,
-                        onValueChange = viewModel::updateScriptText,
-                        label = {
+                    // Import .txt / .md button above the script text box + auto-expanding typing box
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
                             Text(
-                                if (uiState.isMultiSpeaker) {
+                                text = if (uiState.isMultiSpeaker) {
                                     "Naskah Percakapan (ID / EN)"
                                 } else {
                                     "Naskah Teks (ID / EN)"
-                                }
+                                },
+                                style = MaterialTheme.typography.labelLarge
                             )
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(176.dp)
-                            .nestedScroll(scriptScrollIsolator)
-                    )
+                            OutlinedButton(
+                                onClick = {
+                                    scriptFilePickerLauncher.launch(
+                                        arrayOf("text/plain", "text/markdown", "text/*", "application/octet-stream")
+                                    )
+                                },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.UploadFile,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Import .txt / .md", style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+
+                        val boxHeightModifier = if (isScriptFocused) {
+                            Modifier.heightIn(min = 176.dp, max = maxExpandedScriptHeight)
+                        } else {
+                            Modifier.height(176.dp)
+                        }
+
+                        OutlinedTextField(
+                            value = uiState.scriptText,
+                            onValueChange = viewModel::updateScriptText,
+                            placeholder = {
+                                Text(
+                                    if (uiState.isMultiSpeaker) {
+                                        "${uiState.speaker1Name}: Halo, ketik dialog di sini..."
+                                    } else {
+                                        "Ketik atau impor naskah (.txt / .md) di sini..."
+                                    }
+                                )
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .then(boxHeightModifier)
+                                .bringIntoViewRequester(scriptBringIntoView)
+                                .onFocusChanged { focusState ->
+                                    isScriptFocused = focusState.isFocused
+                                }
+                                .nestedScroll(scriptScrollIsolator)
+                        )
+                    }
 
                     Button(
                         onClick = viewModel::generateAndPlay,
@@ -656,6 +793,7 @@ fun TtsPlaygroundScreen(viewModel: TtsViewModel) {
 
                     Spacer(modifier = Modifier.height(12.dp))
                 }
+                }
             }
 
             AppTab.ARTIFACTS -> {
@@ -665,6 +803,7 @@ fun TtsPlaygroundScreen(viewModel: TtsViewModel) {
                     playbackState = playbackState,
                     onRefresh = { viewModel.refreshSavedFiles() },
                     onPlayFile = viewModel::playSavedFile,
+                    onEditFile = viewModel::openAudioEditor,
                     onDeleteFile = viewModel::deleteSavedFile,
                     modifier = Modifier.padding(innerPadding)
                 )
@@ -891,6 +1030,22 @@ fun TtsPlaygroundScreen(viewModel: TtsViewModel) {
             settings = settings,
             onClearLogs = viewModel::clearLogs,
             onDismiss = viewModel::closeLogs
+        )
+    }
+
+    uiState.audioEditor?.let { editorState ->
+        AudioEditorSheet(
+            editorState = editorState,
+            playbackState = playbackState,
+            onTrim = viewModel::trimEditorAudio,
+            onCut = viewModel::cutEditorAudio,
+            onUndo = viewModel::undoEditorAudio,
+            onRedo = viewModel::redoEditorAudio,
+            onTogglePlay = viewModel::toggleEditorPlayback,
+            onRequestSave = viewModel::requestSaveEditor,
+            onDismissSaveConfirm = viewModel::dismissSaveEditorConfirm,
+            onConfirmSave = viewModel::confirmSaveEditedAudio,
+            onDiscard = viewModel::discardAndCloseEditor
         )
     }
 }

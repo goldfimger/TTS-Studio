@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.SuaraStudio" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@android:color/system_accent1_800</item>
+        <item name="android:windowSplashScreenBackground">@android:color/system_accent1_800</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_splash_empty</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@android:color/transparent</item>
+    </style>
+</resources>

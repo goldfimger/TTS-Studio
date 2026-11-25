@@ -125,4 +125,125 @@ object WavAudioUtils {
         val match = Regex("rate=(\\d+)").find(mimeType)
         return match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: DEFAULT_SAMPLE_RATE
     }
+
+    fun durationMs(pcmBytes: ByteArray, sampleRate: Int = DEFAULT_SAMPLE_RATE): Long {
+        val bytesPerSecond = sampleRate.toLong() * 2L
+        if (bytesPerSecond <= 0L) return 0L
+        return (pcmBytes.size.toLong() * 1000L) / bytesPerSecond
+    }
+
+    fun trimPcm(
+        pcmBytes: ByteArray,
+        startFraction: Float,
+        endFraction: Float,
+        sampleRate: Int = DEFAULT_SAMPLE_RATE
+    ): ByteArray {
+        val evenTotal = pcmBytes.size and -2
+        if (evenTotal <= 2) return pcmBytes.copyOf(evenTotal)
+
+        val safeStart = startFraction.coerceIn(0f, 1f)
+        val safeEnd = endFraction.coerceIn(safeStart, 1f)
+        val startByte = ((evenTotal * safeStart).toInt() and -2).coerceIn(0, evenTotal)
+        val endByte = ((evenTotal * safeEnd).toInt() and -2).coerceIn(startByte, evenTotal)
+        if (endByte - startByte < 4) return ByteArray(0)
+
+        val sliced = pcmBytes.copyOfRange(startByte, endByte)
+        return applyEdgeFades(sliced, sampleRate)
+    }
+
+    fun cutPcm(
+        pcmBytes: ByteArray,
+        startFraction: Float,
+        endFraction: Float,
+        sampleRate: Int = DEFAULT_SAMPLE_RATE
+    ): ByteArray {
+        val evenTotal = pcmBytes.size and -2
+        if (evenTotal <= 2) return pcmBytes.copyOf(evenTotal)
+
+        val safeStart = startFraction.coerceIn(0f, 1f)
+        val safeEnd = endFraction.coerceIn(safeStart, 1f)
+        val startByte = ((evenTotal * safeStart).toInt() and -2).coerceIn(0, evenTotal)
+        val endByte = ((evenTotal * safeEnd).toInt() and -2).coerceIn(startByte, evenTotal)
+        if (endByte <= startByte) return pcmBytes.copyOf(evenTotal)
+
+        val prefix = pcmBytes.copyOfRange(0, startByte)
+        val suffix = pcmBytes.copyOfRange(endByte, evenTotal)
+        val fadedPrefix = applyTailFadeOut(prefix, sampleRate, fadeMs = 6L)
+        val fadedSuffix = applyHeadFadeIn(suffix, sampleRate, fadeMs = 6L)
+        return fadedPrefix + fadedSuffix
+    }
+
+    fun computeWaveformBars(pcmBytes: ByteArray, barCount: Int = 56): List<Float> {
+        val evenLen = pcmBytes.size and -2
+        val totalSamples = evenLen / 2
+        if (totalSamples <= 0 || barCount <= 0) return List(barCount.coerceAtLeast(1)) { 0.12f }
+
+        val samplesPerBar = (totalSamples / barCount).coerceAtLeast(1)
+        val step = (samplesPerBar / 24).coerceAtLeast(1)
+        val rawPeaks = FloatArray(barCount)
+        var maxPeak = 1f
+
+        for (b in 0 until barCount) {
+            val sStart = (b * totalSamples) / barCount
+            val sEnd = (((b + 1) * totalSamples) / barCount).coerceAtMost(totalSamples)
+            var peak = 0
+            var idx = sStart
+            while (idx < sEnd) {
+                val byteIdx = idx * 2
+                val low = pcmBytes[byteIdx].toInt() and 0xFF
+                val high = pcmBytes[byteIdx + 1].toInt()
+                val sample = (high shl 8) or low
+                val absVal = kotlin.math.abs(sample)
+                if (absVal > peak) peak = absVal
+                idx += step
+            }
+            rawPeaks[b] = peak.toFloat()
+            if (peak > maxPeak) maxPeak = peak.toFloat()
+        }
+
+        return rawPeaks.map { ((it / maxPeak).coerceIn(0.08f, 1f)) }
+    }
+
+    private fun applyEdgeFades(pcmBytes: ByteArray, sampleRate: Int): ByteArray {
+        return applyTailFadeOut(applyHeadFadeIn(pcmBytes, sampleRate, fadeMs = 6L), sampleRate, fadeMs = 6L)
+    }
+
+    private fun applyHeadFadeIn(pcmBytes: ByteArray, sampleRate: Int, fadeMs: Long): ByteArray {
+        val evenLen = pcmBytes.size and -2
+        if (evenLen <= 2) return pcmBytes.copyOf(evenLen)
+        val out = pcmBytes.copyOf(evenLen)
+        val totalSamples = evenLen / 2
+        val fadeSamples = min(totalSamples, ((sampleRate * fadeMs) / 1000L).toInt().coerceAtLeast(1))
+        for (i in 0 until fadeSamples) {
+            val byteIdx = i * 2
+            val low = out[byteIdx].toInt() and 0xFF
+            val high = out[byteIdx + 1].toInt()
+            val sample = (high shl 8) or low
+            val gain = (i.toDouble() / fadeSamples.toDouble())
+            val attenuated = (sample * gain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+            out[byteIdx] = (attenuated and 0xFF).toByte()
+            out[byteIdx + 1] = ((attenuated ushr 8) and 0xFF).toByte()
+        }
+        return out
+    }
+
+    private fun applyTailFadeOut(pcmBytes: ByteArray, sampleRate: Int, fadeMs: Long): ByteArray {
+        val evenLen = pcmBytes.size and -2
+        if (evenLen <= 2) return pcmBytes.copyOf(evenLen)
+        val out = pcmBytes.copyOf(evenLen)
+        val totalSamples = evenLen / 2
+        val fadeSamples = min(totalSamples, ((sampleRate * fadeMs) / 1000L).toInt().coerceAtLeast(1))
+        val fadeStart = totalSamples - fadeSamples
+        for (i in 0 until fadeSamples) {
+            val byteIdx = (fadeStart + i) * 2
+            val low = out[byteIdx].toInt() and 0xFF
+            val high = out[byteIdx + 1].toInt()
+            val sample = (high shl 8) or low
+            val gain = 1.0 - ((i + 1).toDouble() / fadeSamples.toDouble())
+            val attenuated = (sample * gain).toInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+            out[byteIdx] = (attenuated and 0xFF).toByte()
+            out[byteIdx + 1] = ((attenuated ushr 8) and 0xFF).toByte()
+        }
+        return out
+    }
 }

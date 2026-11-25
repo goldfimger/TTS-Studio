@@ -92,73 +92,75 @@ class GeminiTtsClient {
         }
 
         val isLegacy25Tts = cleanModel.contains("2.5-", ignoreCase = true)
-        val finalPrompt = buildString {
-            val cleanStyle = styleInstruction.trim()
-            if (isLegacy25Tts) {
-                append("Read aloud strictly as speech without adding extra commentary")
-                if (cleanStyle.isNotEmpty()) {
-                    append(" (Style: ").append(cleanStyle).append(")")
+        val cleanStyle = styleInstruction.trim()
+
+        suspend fun executeAttempt(useLegacy25Format: Boolean): TtsResult {
+            val payload = buildRequestPayload(
+                scriptText = cleanScript,
+                styleInstruction = cleanStyle,
+                mode = mode,
+                isLegacy25Tts = useLegacy25Format
+            )
+            val endpoint = "$cleanBase/$cleanVersion/models/${cleanModel}:generateContent"
+
+            var connection: HttpURLConnection? = null
+            try {
+                val url = URL(endpoint)
+                connection = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 20_000
+                    readTimeout = 60_000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                    setRequestProperty("x-goog-api-key", cleanKey)
                 }
-                append(":\n")
-                append(cleanScript)
-            } else {
-                if (cleanStyle.isNotEmpty()) {
-                    append("Style / Director's Notes: ")
-                    append(cleanStyle)
-                    append("\n\n")
+
+                OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
+                    writer.write(payload.toString())
+                    writer.flush()
                 }
-                append(cleanScript)
+
+                val statusCode = connection.responseCode
+                val stream = if (statusCode in 200..299) {
+                    connection.inputStream
+                } else {
+                    connection.errorStream
+                }
+
+                val responseBody = stream?.let {
+                    BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { reader ->
+                        reader.readText()
+                    }
+                }.orEmpty()
+
+                if (statusCode !in 200..299) {
+                    val errText = parseErrorMessage(statusCode, responseBody, cleanModel)
+                    throw GeminiApiException(errText)
+                }
+
+                return parseAudioResponse(responseBody)
+            } catch (e: GeminiApiException) {
+                throw e
+            } catch (_: UnknownHostException) {
+                throw GeminiApiException("Tidak ada koneksi internet. Periksa jaringan Anda.")
+            } catch (_: SocketTimeoutException) {
+                throw GeminiApiException("Permintaan ke Gemini API timeout. Coba naskah yang lebih singkat.")
+            } catch (e: Exception) {
+                throw GeminiApiException(e.localizedMessage ?: "Gagal terhubung ke Gemini API.")
+            } finally {
+                connection?.disconnect()
             }
         }
 
-        val payload = buildRequestPayload(finalPrompt, mode, isLegacy25Tts)
-        val endpoint = "$cleanBase/$cleanVersion/models/${cleanModel}:generateContent"
-
-        var connection: HttpURLConnection? = null
         try {
-            val url = URL(endpoint)
-            connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 20_000
-                readTimeout = 60_000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                setRequestProperty("x-goog-api-key", cleanKey)
-            }
-
-            OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
-                writer.write(payload.toString())
-                writer.flush()
-            }
-
-            val statusCode = connection.responseCode
-            val stream = if (statusCode in 200..299) {
-                connection.inputStream
-            } else {
-                connection.errorStream
-            }
-
-            val responseBody = stream?.let {
-                BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { reader ->
-                    reader.readText()
-                }
-            }.orEmpty()
-
-            if (statusCode !in 200..299) {
-                throw GeminiApiException(parseErrorMessage(statusCode, responseBody, cleanModel))
-            }
-
-            parseAudioResponse(responseBody)
+            executeAttempt(useLegacy25Format = isLegacy25Tts)
         } catch (e: GeminiApiException) {
-            throw e
-        } catch (_: UnknownHostException) {
-            throw GeminiApiException("Tidak ada koneksi internet. Periksa jaringan Anda.")
-        } catch (_: SocketTimeoutException) {
-            throw GeminiApiException("Permintaan ke Gemini API timeout. Coba naskah yang lebih singkat.")
-        } catch (e: Exception) {
-            throw GeminiApiException(e.localizedMessage ?: "Gagal terhubung ke Gemini API.")
-        } finally {
-            connection?.disconnect()
+            val msg = e.message.orEmpty()
+            if (!isLegacy25Tts && msg.contains("Speech metadata", ignoreCase = true)) {
+                executeAttempt(useLegacy25Format = true)
+            } else {
+                throw e
+            }
         }
     }
 
@@ -320,14 +322,71 @@ class GeminiTtsClient {
     }
 
     private fun buildRequestPayload(
-        promptText: String,
+        scriptText: String,
+        styleInstruction: String,
         mode: TtsMode,
         isLegacy25Tts: Boolean
     ): JSONObject {
-        val partObj = JSONObject().put("text", promptText)
+        val partsArray = JSONArray()
+
+        if (isLegacy25Tts) {
+            val prompt25 = if (styleInstruction.isNotEmpty()) {
+                "### DIRECTOR'S NOTES\nStyle: $styleInstruction\n\n#### TRANSCRIPT\n$scriptText"
+            } else {
+                scriptText
+            }
+            partsArray.put(JSONObject().put("text", prompt25))
+        } else {
+            when (mode) {
+                is TtsMode.Single -> {
+                    val partObj = JSONObject().put("text", scriptText)
+                    if (styleInstruction.isNotEmpty()) {
+                        partObj.put(
+                            "speechMetadata",
+                            JSONObject().put("style", styleInstruction)
+                        )
+                    }
+                    partsArray.put(partObj)
+                }
+                is TtsMode.Multi -> {
+                    val s1 = mode.speaker1Name.trim().ifEmpty { "Speaker 1" }
+                    val s2 = mode.speaker2Name.trim().ifEmpty { "Speaker 2" }
+                    val s1Regex = Regex("^${Regex.escape(s1)}\\s*:\\s*(.+)$", RegexOption.IGNORE_CASE)
+                    val s2Regex = Regex("^${Regex.escape(s2)}\\s*:\\s*(.+)$", RegexOption.IGNORE_CASE)
+                    val lines = scriptText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+
+                    var lastSpeaker = s1
+                    for (line in lines) {
+                        val m1 = s1Regex.find(line)
+                        val m2 = s2Regex.find(line)
+                        val (speakerName, spokenLine) = when {
+                            m1 != null -> s1 to "$s1: ${m1.groupValues[1].trim()}"
+                            m2 != null -> s2 to "$s2: ${m2.groupValues[1].trim()}"
+                            else -> lastSpeaker to "$lastSpeaker: $line"
+                        }
+                        lastSpeaker = speakerName
+                        val meta = JSONObject().put("speaker", speakerName)
+                        if (styleInstruction.isNotEmpty()) {
+                            meta.put("style", styleInstruction)
+                        }
+                        partsArray.put(
+                            JSONObject()
+                                .put("text", spokenLine)
+                                .put("speechMetadata", meta)
+                        )
+                    }
+                    if (partsArray.length() == 0) {
+                        val meta = JSONObject().put("speaker", s1)
+                        if (styleInstruction.isNotEmpty()) meta.put("style", styleInstruction)
+                        partsArray.put(JSONObject().put("text", "$s1: $scriptText").put("speechMetadata", meta))
+                    }
+                }
+            }
+        }
+
         val contentObj = JSONObject()
             .put("role", "user")
-            .put("parts", JSONArray().put(partObj))
+            .put("parts", partsArray)
 
         val speechConfig = when (mode) {
             is TtsMode.Single -> {

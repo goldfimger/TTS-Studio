@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AudioFile
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Pause
@@ -66,6 +67,7 @@ fun ResultsTab(
     playbackState: PlaybackState,
     onRefresh: () -> Unit,
     onPlayFile: (SavedAudioFile) -> Unit,
+    onEditFile: (SavedAudioFile) -> Unit,
     onDeleteFile: (SavedAudioFile) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -145,12 +147,19 @@ fun ResultsTab(
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 FilledTonalIconButton(onClick = { onPlayFile(file) }) {
                                     Icon(
                                         imageVector = if (isThisPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
                                         contentDescription = if (isThisPlaying) "Jeda" else "Putar"
+                                    )
+                                }
+
+                                FilledTonalIconButton(onClick = { onEditFile(file) }) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Edit,
+                                        contentDescription = "Edit audio ${file.displayName}"
                                     )
                                 }
 
