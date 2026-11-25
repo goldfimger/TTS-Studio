@@ -11,6 +11,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.suarastudio.tts.ui.SplashScreen
@@ -35,7 +36,13 @@ class MainActivity : ComponentActivity() {
                     TtsPlaygroundScreen(viewModel = viewModel)
 
                     if (showSplash) {
-                        SplashScreen(onFinished = { showSplash = false })
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .zIndex(10f)
+                        ) {
+                            SplashScreen(onFinished = { showSplash = false })
+                        }
                     }
                 }
             }

@@ -9,6 +9,7 @@ import com.suarastudio.tts.audio.MediaStoreSaver
 import com.suarastudio.tts.audio.PcmAudioPlayer
 import com.suarastudio.tts.audio.PlaybackState
 import com.suarastudio.tts.audio.SavedAudioFile
+import com.suarastudio.tts.data.GeminiQuotaException
 import com.suarastudio.tts.data.GeminiTtsClient
 import com.suarastudio.tts.data.GeminiVoice
 import com.suarastudio.tts.data.SettingsRepository
@@ -28,6 +29,31 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.UUID
+
+enum class ApiLogLevel {
+    SUCCESS,
+    INFO,
+    WARNING,
+    ERROR
+}
+
+@Immutable
+data class ApiLogEntry(
+    val id: String,
+    val timestamp: String,
+    val method: String,
+    val endpoint: String,
+    val statusCode: Int?,
+    val level: ApiLogLevel,
+    val actionLabel: String,
+    val detail: String,
+    val durationMs: Long? = null,
+    val totalTokens: Int? = null
+)
 
 enum class AppTab(val label: String) {
     PROJEK("Projek"),
@@ -45,15 +71,24 @@ data class TtsUiState(
     val speaker2Name: String = "Speaker 2",
     val speaker2Voice: GeminiVoice = GeminiVoice.TAVI,
     val styleNotes: String = "",
-    val scriptText: String = "Halo! Selamat datang di Gemini Voice Studio berbasis Gemini 2.5 Flash dan Android 15.",
+    val scriptText: String = "Halo! Selamat datang di Gemini Voice Studio berbasis Gemini TTS API dan Android 15.",
     val isGenerating: Boolean = false,
     val isSavingWav: Boolean = false,
     val downloadProgress: Int? = null,
     val isDownloadDone: Boolean = false,
     val isSettingsOpen: Boolean = false,
     val isApiConnected: Boolean? = null,
+    val detectedTtsModels: List<String> = emptyList(),
+    val isDetectingModels: Boolean = false,
+    val modelDetectionNote: String? = null,
+    val previewingKey: String? = null,
+    val isPreviewLoading: Boolean = false,
     val savedFiles: List<SavedAudioFile> = emptyList(),
-    val activeSavedUri: Uri? = null
+    val activeSavedUri: Uri? = null,
+    val isLogSheetOpen: Boolean = false,
+    val apiLogs: List<ApiLogEntry> = emptyList(),
+    val detectedGeminiSummary: String = "",
+    val allGeminiModelsCount: Int = 0
 )
 
 class TtsViewModel(application: Application) : AndroidViewModel(application) {
@@ -77,26 +112,214 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
     val snackbarMessage: SharedFlow<String> = _snackbarMessage.asSharedFlow()
 
     private var lastAudioResult: TtsResult? = null
+    private var lastDetectedKey: String? = null
+    private val previewCache = mutableMapOf<String, TtsResult>()
 
     init {
-        refreshSavedFiles()
         viewModelScope.launch {
             settings.collectLatest { s ->
-                checkApiConnection(s)
+                refreshSavedFiles(s)
+                checkApiConnectionAndModels(s)
+            }
+        }
+        viewModelScope.launch {
+            playbackState.collectLatest { pb ->
+                if (!pb.isPlaying && !_uiState.value.isPreviewLoading && _uiState.value.previewingKey != null) {
+                    _uiState.update { it.copy(previewingKey = null) }
+                }
             }
         }
     }
 
-    fun checkApiConnection(currentSettings: UserSettings = settings.value) {
-        viewModelScope.launch {
-            val ok = ttsClient.checkApiConnection(
-                apiKey = currentSettings.apiKey,
+    private fun appendApiLog(
+        method: String,
+        endpoint: String,
+        statusCode: Int?,
+        level: ApiLogLevel,
+        actionLabel: String,
+        detail: String,
+        durationMs: Long? = null,
+        totalTokens: Int? = null
+    ) {
+        val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        val entry = ApiLogEntry(
+            id = UUID.randomUUID().toString(),
+            timestamp = time,
+            method = method,
+            endpoint = endpoint,
+            statusCode = statusCode,
+            level = level,
+            actionLabel = actionLabel,
+            detail = detail,
+            durationMs = durationMs,
+            totalTokens = totalTokens
+        )
+        _uiState.update { current ->
+            current.copy(apiLogs = (listOf(entry) + current.apiLogs).take(100))
+        }
+    }
+
+    private suspend fun checkApiConnectionAndModels(currentSettings: UserSettings) {
+        val cleanKey = currentSettings.apiKey.trim()
+        if (cleanKey.isEmpty()) {
+            lastDetectedKey = null
+            _uiState.update {
+                it.copy(
+                    isApiConnected = false,
+                    detectedTtsModels = emptyList(),
+                    modelDetectionNote = null,
+                    detectedGeminiSummary = "",
+                    allGeminiModelsCount = 0
+                )
+            }
+            appendApiLog(
+                method = "INFO",
+                endpoint = "/${currentSettings.apiVersion}/models",
+                statusCode = null,
+                level = ApiLogLevel.WARNING,
+                actionLabel = "Cek Koneksi API",
+                detail = "API Key belum diisi di Pengaturan."
+            )
+            return
+        }
+
+        val started = System.currentTimeMillis()
+        val ok = ttsClient.checkApiConnection(
+            apiKey = cleanKey,
+            apiBaseUrl = currentSettings.apiBaseUrl,
+            apiVersion = currentSettings.apiVersion,
+            modelId = currentSettings.modelId
+        )
+        val elapsed = System.currentTimeMillis() - started
+        _uiState.update { it.copy(isApiConnected = ok) }
+        appendApiLog(
+            method = "GET",
+            endpoint = "/${currentSettings.apiVersion}/models?pageSize=20",
+            statusCode = if (ok) 200 else 401,
+            level = if (ok) ApiLogLevel.SUCCESS else ApiLogLevel.ERROR,
+            actionLabel = "Cek Koneksi Server",
+            detail = if (ok) "Terhubung ke server Gemini API." else "Gagal terhubung ke server Gemini API.",
+            durationMs = elapsed
+        )
+
+        if (ok && lastDetectedKey != cleanKey) {
+            lastDetectedKey = cleanKey
+            detectModelsInternal(
+                apiKey = cleanKey,
                 apiBaseUrl = currentSettings.apiBaseUrl,
                 apiVersion = currentSettings.apiVersion,
-                modelId = currentSettings.modelId
+                autoApplyToSettings = true
             )
-            _uiState.update { it.copy(isApiConnected = ok) }
         }
+    }
+
+    fun detectModelsForKey(
+        apiKey: String,
+        apiBaseUrl: String,
+        apiVersion: String,
+        onRecommendedModel: ((String) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val recommended = detectModelsInternal(
+                apiKey = apiKey,
+                apiBaseUrl = apiBaseUrl,
+                apiVersion = apiVersion,
+                autoApplyToSettings = false
+            )
+            if (!recommended.isNullOrBlank()) {
+                onRecommendedModel?.invoke(recommended)
+            }
+        }
+    }
+
+    private suspend fun detectModelsInternal(
+        apiKey: String,
+        apiBaseUrl: String,
+        apiVersion: String,
+        autoApplyToSettings: Boolean
+    ): String? {
+        if (apiKey.isBlank()) {
+            _uiState.update {
+                it.copy(
+                    isDetectingModels = false,
+                    detectedTtsModels = emptyList(),
+                    modelDetectionNote = "Masukkan API Key terlebih dahulu."
+                )
+            }
+            return null
+        }
+
+        _uiState.update {
+            it.copy(
+                isDetectingModels = true,
+                modelDetectionNote = "Mendeteksi model TTS dari API Key..."
+            )
+        }
+
+        val started = System.currentTimeMillis()
+        val res = ttsClient.detectAvailableTtsModels(apiKey, apiBaseUrl, apiVersion)
+        val elapsed = System.currentTimeMillis() - started
+        return res.fold(
+            onSuccess = { detected ->
+                val list = detected.ttsModels
+                val rec = detected.recommendedModel
+                val currentModel = settings.value.modelId
+                val chosen = if (rec != null && list.none { it.equals(currentModel, ignoreCase = true) }) {
+                    rec
+                } else {
+                    currentModel
+                }
+
+                if (autoApplyToSettings && rec != null && list.none { it.equals(currentModel, ignoreCase = true) }) {
+                    settingsRepo.saveModelId(rec)
+                }
+
+                val note = if (list.isNotEmpty()) {
+                    "Terdeteksi ${list.size} model TTS aktif untuk API Key ini."
+                } else {
+                    "Tidak ada model TTS khusus tercantum; gunakan preset standar."
+                }
+
+                _uiState.update {
+                    it.copy(
+                        isApiConnected = true,
+                        isDetectingModels = false,
+                        detectedTtsModels = list,
+                        modelDetectionNote = note,
+                        detectedGeminiSummary = detected.geminiTypeSummary,
+                        allGeminiModelsCount = detected.allGeminiModelsCount
+                    )
+                }
+                appendApiLog(
+                    method = "GET",
+                    endpoint = "/${apiVersion.trim().ifEmpty { "v1beta" }}/models?pageSize=200",
+                    statusCode = 200,
+                    level = ApiLogLevel.SUCCESS,
+                    actionLabel = "Deteksi Model TTS",
+                    detail = if (list.isNotEmpty()) "Ditemukan: ${list.joinToString(", ")}" else note,
+                    durationMs = elapsed
+                )
+                chosen
+            },
+            onFailure = { err ->
+                _uiState.update {
+                    it.copy(
+                        isDetectingModels = false,
+                        modelDetectionNote = err.message ?: "Gagal mendeteksi model."
+                    )
+                }
+                appendApiLog(
+                    method = "GET",
+                    endpoint = "/${apiVersion.trim().ifEmpty { "v1beta" }}/models?pageSize=200",
+                    statusCode = null,
+                    level = ApiLogLevel.ERROR,
+                    actionLabel = "Deteksi Model TTS",
+                    detail = err.message ?: "Gagal mendeteksi model.",
+                    durationMs = elapsed
+                )
+                null
+            }
+        )
     }
 
     fun toggleQuickTheme(isCurrentlyDark: Boolean) {
@@ -106,9 +329,11 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun updateDownloadDirectory(directory: String) {
+    fun updateDownloadFolder(treeUri: Uri) {
         viewModelScope.launch {
-            settingsRepo.saveDownloadDirectory(directory)
+            val label = MediaStoreSaver.extractFolderLabel(treeUri)
+            settingsRepo.saveDownloadFolder(treeUri.toString(), label)
+            _snackbarMessage.tryEmit("Folder penyimpanan diatur ke: $label")
         }
     }
 
@@ -167,6 +392,33 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(isSettingsOpen = false) }
     }
 
+    fun openLogs() {
+        _uiState.update { it.copy(isLogSheetOpen = true) }
+    }
+
+    fun closeLogs() {
+        _uiState.update { it.copy(isLogSheetOpen = false) }
+    }
+
+    fun clearLogs() {
+        _uiState.update { it.copy(apiLogs = emptyList()) }
+    }
+
+    fun resetDailyQuotaUsage() {
+        viewModelScope.launch {
+            settingsRepo.resetDailyUsage()
+            appendApiLog(
+                method = "INFO",
+                endpoint = "local://quota-tracker",
+                statusCode = null,
+                level = ApiLogLevel.INFO,
+                actionLabel = "Reset Kuota Harian",
+                detail = "Penghitung pemakaian request dan token harian direset ke 0."
+            )
+            _snackbarMessage.tryEmit("Hitungan pemakaian kuota hari ini direset.")
+        }
+    }
+
     fun saveSettings(
         apiKey: String,
         themeMode: ThemeMode,
@@ -174,9 +426,12 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
         modelId: String,
         apiBaseUrl: String,
         apiVersion: String,
-        sampleRateHz: Int
+        sampleRateHz: Int,
+        dailyRequestLimit: Int,
+        dailyTokenLimit: Int
     ) {
         viewModelScope.launch {
+            lastDetectedKey = null
             settingsRepo.saveAll(
                 apiKey = apiKey,
                 themeMode = themeMode,
@@ -184,7 +439,9 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
                 modelId = modelId,
                 apiBaseUrl = apiBaseUrl,
                 apiVersion = apiVersion,
-                sampleRateHz = sampleRateHz
+                sampleRateHz = sampleRateHz,
+                dailyRequestLimit = dailyRequestLimit,
+                dailyTokenLimit = dailyTokenLimit
             )
             _uiState.update { it.copy(isSettingsOpen = false) }
             _snackbarMessage.tryEmit("Pengaturan & API TTS disimpan.")
@@ -213,6 +470,18 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
             TtsMode.Single(state.singleVoice)
         }
 
+        val modeLabel = if (state.isMultiSpeaker) {
+            "Multi-Speaker (${state.speaker1Voice.voiceName} & ${state.speaker2Voice.voiceName})"
+        } else {
+            "Single Voice (${state.singleVoice.voiceName})"
+        }
+        val effectiveModel = if (state.isMultiSpeaker && currentSettings.modelId == "gemini-3.8-flash-lite-tts") {
+            "gemini-3.8-flash-tts"
+        } else {
+            currentSettings.modelId
+        }
+        val endpointPath = "/${currentSettings.apiVersion}/models/$effectiveModel:generateContent"
+
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
@@ -222,6 +491,7 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
                     downloadProgress = null
                 )
             }
+            val started = System.currentTimeMillis()
             try {
                 val result = ttsClient.generateSpeech(
                     apiKey = currentSettings.apiKey,
@@ -232,10 +502,45 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
                     styleInstruction = state.styleNotes,
                     mode = mode
                 )
+                val elapsed = System.currentTimeMillis() - started
                 lastAudioResult = result
+                settingsRepo.recordTtsUsage(result.usage)
                 _uiState.update { it.copy(isApiConnected = true) }
+                appendApiLog(
+                    method = "POST",
+                    endpoint = endpointPath,
+                    statusCode = 200,
+                    level = ApiLogLevel.SUCCESS,
+                    actionLabel = "Sintesis TTS · $modeLabel",
+                    detail = "Berhasil membuat ${result.audioBytes.size / 1024} KB audio (Input ${result.usage.promptTokens} · Audio ${result.usage.audioTokens} token).",
+                    durationMs = elapsed,
+                    totalTokens = result.usage.totalTokens
+                )
                 audioPlayer.loadAndPlay(result.audioBytes, result.mimeType)
+            } catch (e: GeminiQuotaException) {
+                val elapsed = System.currentTimeMillis() - started
+                settingsRepo.recordQuotaAlert(e.message ?: "Kuota TTS tercapai (429).", e.quotaLimitFromServer)
+                appendApiLog(
+                    method = "POST",
+                    endpoint = endpointPath,
+                    statusCode = 429,
+                    level = ApiLogLevel.WARNING,
+                    actionLabel = "Limit Kuota TTS",
+                    detail = e.message ?: "Kuota TTS tercapai (429).",
+                    durationMs = elapsed
+                )
+                _snackbarMessage.tryEmit(e.message ?: "Kuota TTS tercapai.")
             } catch (e: Exception) {
+                val elapsed = System.currentTimeMillis() - started
+                appendApiLog(
+                    method = "POST",
+                    endpoint = endpointPath,
+                    statusCode = null,
+                    level = ApiLogLevel.ERROR,
+                    actionLabel = "Gagal Sintesis TTS",
+                    detail = e.message ?: "Gagal menghasilkan audio.",
+                    durationMs = elapsed
+                )
                 _snackbarMessage.tryEmit(e.message ?: "Gagal menghasilkan audio.")
             } finally {
                 _uiState.update { it.copy(isGenerating = false) }
@@ -247,7 +552,157 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopPlayback() {
         audioPlayer.stop()
-        _uiState.update { it.copy(activeSavedUri = null) }
+        _uiState.update { it.copy(activeSavedUri = null, previewingKey = null, isPreviewLoading = false) }
+    }
+
+    fun stopPreview() {
+        audioPlayer.stop()
+        _uiState.update { it.copy(previewingKey = null, isPreviewLoading = false) }
+    }
+
+    fun previewVoice(voice: GeminiVoice) {
+        val key = "voice:${voice.voiceName}"
+        if (_uiState.value.previewingKey == key && (playbackState.value.isPlaying || _uiState.value.isPreviewLoading)) {
+            stopPreview()
+            return
+        }
+        val sample = "Halo, ini adalah contoh suara ${voice.voiceName} di Voice Studio."
+        runPreview(
+            previewKey = key,
+            voice = voice,
+            styleInstruction = "",
+            sampleText = sample
+        )
+    }
+
+    fun previewStyle(styleTitle: String, styleInstruction: String, sampleText: String) {
+        val key = "style:$styleTitle"
+        if (_uiState.value.previewingKey == key && (playbackState.value.isPlaying || _uiState.value.isPreviewLoading)) {
+            stopPreview()
+            return
+        }
+        val activeVoice = if (_uiState.value.isMultiSpeaker) {
+            _uiState.value.speaker1Voice
+        } else {
+            _uiState.value.singleVoice
+        }
+        val textToSpeak = sampleText.ifBlank {
+            "Halo! Ini adalah contoh intonasi untuk gaya $styleTitle."
+        }
+        runPreview(
+            previewKey = key,
+            voice = activeVoice,
+            styleInstruction = styleInstruction,
+            sampleText = textToSpeak
+        )
+    }
+
+    private fun runPreview(
+        previewKey: String,
+        voice: GeminiVoice,
+        styleInstruction: String,
+        sampleText: String
+    ) {
+        val currentSettings = settings.value
+        if (currentSettings.apiKey.isBlank()) {
+            _snackbarMessage.tryEmit("Masukkan Gemini API Key di Pengaturan untuk preview suara.")
+            return
+        }
+
+        val cacheKey = "${currentSettings.modelId}|$previewKey|${voice.voiceName}|$styleInstruction"
+        val endpointPath = "/${currentSettings.apiVersion}/models/${currentSettings.modelId}:generateContent"
+        previewCache[cacheKey]?.let { cached ->
+            audioPlayer.stop()
+            _uiState.update {
+                it.copy(
+                    previewingKey = previewKey,
+                    isPreviewLoading = false,
+                    activeSavedUri = null
+                )
+            }
+            appendApiLog(
+                method = "CACHE",
+                endpoint = endpointPath,
+                statusCode = 200,
+                level = ApiLogLevel.INFO,
+                actionLabel = "Preview Audio (Cache)",
+                detail = "Memutar ulang preview $previewKey dengan suara ${voice.voiceName} tanpa kuota tambahan."
+            )
+            audioPlayer.loadAndPlay(cached.audioBytes, cached.mimeType)
+            return
+        }
+
+        viewModelScope.launch {
+            audioPlayer.stop()
+            _uiState.update {
+                it.copy(
+                    previewingKey = previewKey,
+                    isPreviewLoading = true,
+                    activeSavedUri = null
+                )
+            }
+            val started = System.currentTimeMillis()
+            try {
+                val res = ttsClient.generateSpeech(
+                    apiKey = currentSettings.apiKey,
+                    apiBaseUrl = currentSettings.apiBaseUrl,
+                    apiVersion = currentSettings.apiVersion,
+                    modelId = currentSettings.modelId,
+                    scriptText = sampleText,
+                    styleInstruction = styleInstruction,
+                    mode = TtsMode.Single(voice)
+                )
+                val elapsed = System.currentTimeMillis() - started
+                previewCache[cacheKey] = res
+                settingsRepo.recordTtsUsage(res.usage)
+                appendApiLog(
+                    method = "POST",
+                    endpoint = endpointPath,
+                    statusCode = 200,
+                    level = ApiLogLevel.SUCCESS,
+                    actionLabel = "Preview · ${voice.voiceName}",
+                    detail = "Preview $previewKey (${res.audioBytes.size / 1024} KB · Input ${res.usage.promptTokens} · Audio ${res.usage.audioTokens} token).",
+                    durationMs = elapsed,
+                    totalTokens = res.usage.totalTokens
+                )
+                // Ensure user didn't cancel or switch preview while loading
+                if (_uiState.value.previewingKey == previewKey) {
+                    _uiState.update { it.copy(isPreviewLoading = false, isApiConnected = true) }
+                    audioPlayer.loadAndPlay(res.audioBytes, res.mimeType)
+                }
+            } catch (e: GeminiQuotaException) {
+                val elapsed = System.currentTimeMillis() - started
+                settingsRepo.recordQuotaAlert(e.message ?: "Kuota TTS tercapai (429).", e.quotaLimitFromServer)
+                appendApiLog(
+                    method = "POST",
+                    endpoint = endpointPath,
+                    statusCode = 429,
+                    level = ApiLogLevel.WARNING,
+                    actionLabel = "Limit Kuota Preview",
+                    detail = e.message ?: "Kuota TTS tercapai (429).",
+                    durationMs = elapsed
+                )
+                if (_uiState.value.previewingKey == previewKey) {
+                    _uiState.update { it.copy(previewingKey = null, isPreviewLoading = false) }
+                }
+                _snackbarMessage.tryEmit(e.message ?: "Kuota TTS tercapai.")
+            } catch (e: Exception) {
+                val elapsed = System.currentTimeMillis() - started
+                appendApiLog(
+                    method = "POST",
+                    endpoint = endpointPath,
+                    statusCode = null,
+                    level = ApiLogLevel.ERROR,
+                    actionLabel = "Gagal Preview",
+                    detail = e.message ?: "Gagal memutar preview.",
+                    durationMs = elapsed
+                )
+                if (_uiState.value.previewingKey == previewKey) {
+                    _uiState.update { it.copy(previewingKey = null, isPreviewLoading = false) }
+                }
+                _snackbarMessage.tryEmit(e.message ?: "Gagal memutar preview.")
+            }
+        }
     }
 
     fun seekTo(positionMs: Long) = audioPlayer.seekTo(positionMs)
@@ -260,6 +715,7 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (_uiState.value.isSavingWav) return
 
+        val currentSettings = settings.value
         viewModelScope.launch {
             _uiState.update {
                 it.copy(
@@ -272,8 +728,10 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
                 context = getApplication(),
                 rawOrWavBytes = result.audioBytes,
                 mimeType = result.mimeType,
-                targetDirectory = settings.value.downloadDirectory,
-                sampleRateOverride = settings.value.sampleRateHz,
+                targetDirectory = currentSettings.downloadDirectory,
+                treeUriString = currentSettings.downloadTreeUri,
+                folderLabel = currentSettings.downloadFolderLabel,
+                sampleRateOverride = currentSettings.sampleRateHz,
                 onProgress = { pct ->
                     _uiState.update { it.copy(downloadProgress = pct) }
                 }
@@ -286,8 +744,16 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
                         isDownloadDone = true
                     )
                 }
+                appendApiLog(
+                    method = "EXPORT",
+                    endpoint = savedPath,
+                    statusCode = null,
+                    level = ApiLogLevel.INFO,
+                    actionLabel = "Simpan Audio WAV",
+                    detail = "File audio disimpan ke $savedPath (${currentSettings.sampleRateHz} Hz)."
+                )
                 _snackbarMessage.tryEmit("Done · Tersimpan di $savedPath")
-                refreshSavedFiles()
+                refreshSavedFiles(currentSettings)
                 delay(2_200)
                 _uiState.update { it.copy(downloadProgress = null, isDownloadDone = false) }
             }.onFailure { err ->
@@ -303,9 +769,13 @@ class TtsViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun refreshSavedFiles() {
+    fun refreshSavedFiles(currentSettings: UserSettings = settings.value) {
         viewModelScope.launch {
-            val files = MediaStoreSaver.listSavedWavFiles(getApplication())
+            val files = MediaStoreSaver.listSavedWavFiles(
+                context = getApplication(),
+                treeUriString = currentSettings.downloadTreeUri,
+                folderLabel = currentSettings.downloadFolderLabel
+            )
             _uiState.update { it.copy(savedFiles = files) }
         }
     }

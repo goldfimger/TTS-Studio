@@ -33,12 +33,33 @@ sealed interface TtsMode {
     ) : TtsMode
 }
 
-data class TtsResult(
-    val audioBytes: ByteArray,
-    val mimeType: String
+data class TtsUsageMetadata(
+    val promptTokens: Int = 0,
+    val audioTokens: Int = 0,
+    val totalTokens: Int = 0
 )
 
-class GeminiApiException(message: String) : Exception(message)
+data class TtsResult(
+    val audioBytes: ByteArray,
+    val mimeType: String,
+    val usage: TtsUsageMetadata = TtsUsageMetadata()
+)
+
+data class DetectedModelsResult(
+    val ttsModels: List<String>,
+    val recommendedModel: String?,
+    val allGeminiModelsCount: Int = 0,
+    val geminiTypeSummary: String = ""
+)
+
+open class GeminiApiException(message: String) : Exception(message)
+
+class GeminiQuotaException(
+    message: String,
+    val quotaLimitFromServer: Int? = null,
+    val retryDelay: String? = null,
+    val isFreeTierHint: Boolean = false
+) : GeminiApiException(message)
 
 class GeminiTtsClient {
 
@@ -61,20 +82,36 @@ class GeminiTtsClient {
             throw GeminiApiException("Teks naskah tidak boleh kosong.")
         }
 
-        val finalPrompt = buildString {
-            val cleanStyle = styleInstruction.trim()
-            if (cleanStyle.isNotEmpty()) {
-                append("Style / Director's Notes: ")
-                append(cleanStyle)
-                append("\n\n")
-            }
-            append(cleanScript)
-        }
-
-        val payload = buildRequestPayload(finalPrompt, mode)
         val cleanBase = apiBaseUrl.trim().trimEnd('/').ifEmpty { "https://generativelanguage.googleapis.com" }
         val cleanVersion = apiVersion.trim().trim('/').ifEmpty { "v1beta" }
-        val cleanModel = modelId.trim().ifEmpty { "gemini-2.5-flash" }
+        val rawModel = modelId.trim().ifEmpty { "gemini-3.8-flash-lite-tts" }
+        val cleanModel = when {
+            rawModel == "gemini-2.5-flash" -> "gemini-3.8-flash-lite-tts"
+            mode is TtsMode.Multi && rawModel == "gemini-3.8-flash-lite-tts" -> "gemini-3.8-flash-tts"
+            else -> rawModel
+        }
+
+        val isLegacy25Tts = cleanModel.contains("2.5-", ignoreCase = true)
+        val finalPrompt = buildString {
+            val cleanStyle = styleInstruction.trim()
+            if (isLegacy25Tts) {
+                append("Read aloud strictly as speech without adding extra commentary")
+                if (cleanStyle.isNotEmpty()) {
+                    append(" (Style: ").append(cleanStyle).append(")")
+                }
+                append(":\n")
+                append(cleanScript)
+            } else {
+                if (cleanStyle.isNotEmpty()) {
+                    append("Style / Director's Notes: ")
+                    append(cleanStyle)
+                    append("\n\n")
+                }
+                append(cleanScript)
+            }
+        }
+
+        val payload = buildRequestPayload(finalPrompt, mode, isLegacy25Tts)
         val endpoint = "$cleanBase/$cleanVersion/models/${cleanModel}:generateContent"
 
         var connection: HttpURLConnection? = null
@@ -108,7 +145,7 @@ class GeminiTtsClient {
             }.orEmpty()
 
             if (statusCode !in 200..299) {
-                throw GeminiApiException(parseErrorMessage(statusCode, responseBody))
+                throw GeminiApiException(parseErrorMessage(statusCode, responseBody, cleanModel))
             }
 
             parseAudioResponse(responseBody)
@@ -125,19 +162,137 @@ class GeminiTtsClient {
         }
     }
 
+    suspend fun detectAvailableTtsModels(
+        apiKey: String,
+        apiBaseUrl: String,
+        apiVersion: String
+    ): Result<DetectedModelsResult> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanKey = apiKey.trim()
+            if (cleanKey.isEmpty()) {
+                throw GeminiApiException("API Key belum diisi.")
+            }
+            val cleanBase = apiBaseUrl.trim().trimEnd('/').ifEmpty { "https://generativelanguage.googleapis.com" }
+            val cleanVersion = apiVersion.trim().trim('/').ifEmpty { "v1beta" }
+            val endpoint = "$cleanBase/$cleanVersion/models?pageSize=200"
+
+            var connection: HttpURLConnection? = null
+            val responseBody: String
+            val statusCode: Int
+            try {
+                connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 10_000
+                    readTimeout = 15_000
+                    setRequestProperty("x-goog-api-key", cleanKey)
+                }
+                statusCode = connection.responseCode
+                val stream = if (statusCode in 200..299) connection.inputStream else connection.errorStream
+                responseBody = stream?.let {
+                    BufferedReader(InputStreamReader(it, Charsets.UTF_8)).use { r -> r.readText() }
+                }.orEmpty()
+            } finally {
+                connection?.disconnect()
+            }
+
+            if (statusCode !in 200..299) {
+                throw GeminiApiException(parseErrorMessage(statusCode, responseBody, "models"))
+            }
+
+            val root = JSONObject(responseBody)
+            val modelsArray = root.optJSONArray("models") ?: JSONArray()
+            val candidates = mutableListOf<String>()
+            val allGeminiIds = mutableListOf<String>()
+
+            for (i in 0 until modelsArray.length()) {
+                val obj = modelsArray.optJSONObject(i) ?: continue
+                val fullName = obj.optString("name").orEmpty()
+                val shortId = fullName.removePrefix("models/").trim()
+                if (shortId.isEmpty()) continue
+                val lower = shortId.lowercase()
+                if (lower.contains("gemini")) {
+                    allGeminiIds.add(shortId)
+                }
+
+                val methodsArray = obj.optJSONArray("supportedGenerationMethods")
+                val supportsGenerate = if (methodsArray == null) {
+                    true
+                } else {
+                    (0 until methodsArray.length()).any { idx ->
+                        methodsArray.optString(idx) == "generateContent"
+                    }
+                }
+                if (!supportsGenerate) continue
+
+                val isDedicatedTts = lower.contains("tts") ||
+                    (lower.contains("speech") && !lower.includesAudioOnlyExclusion(lower))
+                if (isDedicatedTts) {
+                    candidates.add(shortId)
+                }
+            }
+
+            val priorityOrder = listOf(
+                "gemini-3.8-flash-lite-tts",
+                "gemini-3.8-flash-tts",
+                "gemini-3.1-flash-tts-preview",
+                "gemini-2.5-flash-tts",
+                "gemini-2.5-flash-preview-tts",
+                "gemini-2.5-pro-preview-tts"
+            )
+
+            val sorted = candidates.distinct().sortedWith(
+                compareBy<String> { model ->
+                    val idx = priorityOrder.indexOfFirst { model.equals(it, ignoreCase = true) }
+                    if (idx >= 0) idx else priorityOrder.size
+                }.thenBy { it }
+            )
+
+            val has38 = allGeminiIds.any { it.contains("3.8", ignoreCase = true) } ||
+                sorted.any { it.contains("3.8", ignoreCase = true) }
+            val has31 = allGeminiIds.any { it.contains("3.1", ignoreCase = true) } ||
+                sorted.any { it.contains("3.1", ignoreCase = true) }
+            val has25 = allGeminiIds.any { it.contains("2.5", ignoreCase = true) } ||
+                sorted.any { it.contains("2.5", ignoreCase = true) }
+            val hasProTts = sorted.any { it.contains("pro", ignoreCase = true) }
+            val hasProAny = allGeminiIds.any { it.contains("pro", ignoreCase = true) }
+
+            val familyParts = buildList {
+                if (has38) add("Gemini 3.8 TTS")
+                else if (has31) add("Gemini 3.1 TTS")
+                if (has25) add("Gemini 2.5")
+                if (hasProTts) add("Pro TTS")
+                else if (hasProAny) add("Pro")
+            }
+            val typeSummary = if (familyParts.isNotEmpty()) {
+                familyParts.joinToString(" · ")
+            } else {
+                sorted.firstOrNull() ?: "Gemini TTS"
+            }
+
+            DetectedModelsResult(
+                ttsModels = sorted,
+                recommendedModel = sorted.firstOrNull(),
+                allGeminiModelsCount = allGeminiIds.distinct().size,
+                geminiTypeSummary = typeSummary
+            )
+        }
+    }
+
+    private fun String.includesAudioOnlyExclusion(lower: String): Boolean =
+        lower.contains("native-audio")
+
     suspend fun checkApiConnection(
         apiKey: String,
         apiBaseUrl: String,
         apiVersion: String,
-        modelId: String
+        @Suppress("UNUSED_PARAMETER") modelId: String
     ): Boolean = withContext(Dispatchers.IO) {
         val cleanKey = apiKey.trim()
         if (cleanKey.isEmpty()) return@withContext false
 
         val cleanBase = apiBaseUrl.trim().trimEnd('/').ifEmpty { "https://generativelanguage.googleapis.com" }
         val cleanVersion = apiVersion.trim().trim('/').ifEmpty { "v1beta" }
-        val cleanModel = modelId.trim().ifEmpty { "gemini-2.5-flash" }
-        val endpoint = "$cleanBase/$cleanVersion/models/$cleanModel"
+        val endpoint = "$cleanBase/$cleanVersion/models?pageSize=20"
 
         var connection: HttpURLConnection? = null
         try {
@@ -155,7 +310,20 @@ class GeminiTtsClient {
         }
     }
 
-    private fun buildRequestPayload(promptText: String, mode: TtsMode): JSONObject {
+    private fun resolveVoiceForModel(voice: GeminiVoice, isLegacy25Tts: Boolean): String {
+        // Legacy 2.5 preview TTS supports the core 30 voices; map extended voices cleanly so requests never fail
+        return if (isLegacy25Tts && voice == GeminiVoice.TAVI) {
+            GeminiVoice.AOEDE.voiceName
+        } else {
+            voice.voiceName
+        }
+    }
+
+    private fun buildRequestPayload(
+        promptText: String,
+        mode: TtsMode,
+        isLegacy25Tts: Boolean
+    ): JSONObject {
         val partObj = JSONObject().put("text", promptText)
         val contentObj = JSONObject()
             .put("role", "user")
@@ -167,7 +335,7 @@ class GeminiTtsClient {
                     "voiceConfig",
                     JSONObject().put(
                         "prebuiltVoiceConfig",
-                        JSONObject().put("voiceName", mode.voice.voiceName)
+                        JSONObject().put("voiceName", resolveVoiceForModel(mode.voice, isLegacy25Tts))
                     )
                 )
             }
@@ -182,7 +350,7 @@ class GeminiTtsClient {
                                 "voiceConfig",
                                 JSONObject().put(
                                     "prebuiltVoiceConfig",
-                                    JSONObject().put("voiceName", mode.speaker1Voice.voiceName)
+                                    JSONObject().put("voiceName", resolveVoiceForModel(mode.speaker1Voice, isLegacy25Tts))
                                 )
                             )
                     )
@@ -193,7 +361,7 @@ class GeminiTtsClient {
                                 "voiceConfig",
                                 JSONObject().put(
                                     "prebuiltVoiceConfig",
-                                    JSONObject().put("voiceName", mode.speaker2Voice.voiceName)
+                                    JSONObject().put("voiceName", resolveVoiceForModel(mode.speaker2Voice, isLegacy25Tts))
                                 )
                             )
                     )
@@ -215,6 +383,17 @@ class GeminiTtsClient {
 
     private fun parseAudioResponse(responseBody: String): TtsResult {
         val root = JSONObject(responseBody)
+        val usageObj = root.optJSONObject("usageMetadata")
+        val usage = if (usageObj != null) {
+            TtsUsageMetadata(
+                promptTokens = usageObj.optInt("promptTokenCount", 0),
+                audioTokens = usageObj.optInt("candidatesTokenCount", 0),
+                totalTokens = usageObj.optInt("totalTokenCount", 0)
+            )
+        } else {
+            TtsUsageMetadata()
+        }
+
         val candidates = root.optJSONArray("candidates")
             ?: throw GeminiApiException("Respons API tidak mengandung audio.")
         if (candidates.length() == 0) {
@@ -232,27 +411,59 @@ class GeminiTtsClient {
             if (base64.isNotEmpty()) {
                 val mime = inlineData?.optString("mimeType").orEmpty().ifEmpty { "audio/L16" }
                 val decoded = Base64.decode(base64, Base64.DEFAULT)
-                return TtsResult(audioBytes = decoded, mimeType = mime)
+                return TtsResult(audioBytes = decoded, mimeType = mime, usage = usage)
             }
         }
 
         throw GeminiApiException("Data audio Base64 tidak ditemukan dalam respons Gemini.")
     }
 
-    private fun parseErrorMessage(statusCode: Int, responseBody: String): String {
-        val apiMessage = runCatching {
-            JSONObject(responseBody).optJSONObject("error")?.optString("message")
-        }.getOrNull().orEmpty()
+    private fun parseErrorMessage(statusCode: Int, responseBody: String, modelUsed: String): String {
+        val errorObj = runCatching { JSONObject(responseBody).optJSONObject("error") }.getOrNull()
+        val apiMessage = errorObj?.optString("message").orEmpty()
+
+        if (statusCode == 429) {
+            var quotaVal: Int? = null
+            var retryDelay: String? = null
+            var isFreeTier = apiMessage.contains("free_tier", ignoreCase = true) ||
+                apiMessage.contains("free tier", ignoreCase = true)
+            val details = errorObj?.optJSONArray("details")
+            if (details != null) {
+                for (i in 0 until details.length()) {
+                    val d = details.optJSONObject(i) ?: continue
+                    val violations = d.optJSONArray("violations")
+                    if (violations != null && violations.length() > 0) {
+                        val v0 = violations.optJSONObject(0)
+                        val vStr = v0?.optString("quotaValue").orEmpty()
+                        val metric = v0?.optString("quotaMetric").orEmpty()
+                        if (metric.contains("free_tier", ignoreCase = true)) {
+                            isFreeTier = true
+                        }
+                        quotaVal = vStr.toIntOrNull() ?: quotaVal
+                    }
+                    val rd = d.optString("retryDelay").orEmpty()
+                    if (rd.isNotEmpty()) retryDelay = rd
+                }
+            }
+            val limitPart = quotaVal?.let { " Jatah limit server: $it." }.orEmpty()
+            val tierTag = if (isFreeTier) " [Free Tier]" else ""
+            val retryPart = retryDelay?.let { " Coba lagi dalam $it." }.orEmpty()
+            throw GeminiQuotaException(
+                message = "Kuota TTS tercapai (429)$tierTag.$limitPart$retryPart",
+                quotaLimitFromServer = quotaVal,
+                retryDelay = retryDelay,
+                isFreeTierHint = isFreeTier
+            )
+        }
 
         return when (statusCode) {
-            400 -> if (apiMessage.contains("API_KEY", ignoreCase = true)) {
-                "API Key tidak valid. Periksa kembali Gemini API Key di Settings."
+            400 -> if (apiMessage.contains("API_KEY", ignoreCase = true) || apiMessage.contains("API key", ignoreCase = true)) {
+                "API Key tidak valid. Pastikan salin Gemini API Key (AQ... atau AIza...) dari aistudio.google.com/api-keys."
             } else {
                 "Permintaan ditolak (400): ${apiMessage.ifEmpty { "Periksa format naskah atau model." }}"
             }
-            401, 403 -> "Akses ditolak ($statusCode). Pastikan Gemini API Key valid dan aktif."
-            404 -> "Model atau endpoint tidak ditemukan (404). Periksa pengaturan API TTS di Settings."
-            429 -> "Batas kuota tercapai (429). Tunggu sebentar sebelum mencoba lagi."
+            401, 403 -> "Akses ditolak ($statusCode): ${apiMessage.ifEmpty { "Pastikan Gemini API Key valid dan aktif." }}"
+            404 -> "Model '$modelUsed' tidak ditemukan (404): ${apiMessage.ifEmpty { "Gunakan Deteksi Model TTS di Settings." }}"
             else -> "Kesalahan server ($statusCode): ${apiMessage.ifEmpty { "Silakan coba lagi." }}"
         }
     }

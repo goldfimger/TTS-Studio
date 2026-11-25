@@ -42,7 +42,8 @@ class PcmAudioPlayer {
     fun loadAndPlay(rawOrWavBytes: ByteArray, mimeType: String) {
         stopInternal(clearAudio = false)
         sampleRate = WavAudioUtils.parseSampleRate(mimeType)
-        pcmData = WavAudioUtils.extractPcmPayload(rawOrWavBytes)
+        val extracted = WavAudioUtils.extractPcmPayload(rawOrWavBytes)
+        pcmData = WavAudioUtils.sanitizeAndSmoothTail(extracted, sampleRate)
         currentByteOffset = 0
 
         val bytesPerSecond = sampleRate * 2L // 16-bit mono = 2 bytes per sample
@@ -116,13 +117,18 @@ class PcmAudioPlayer {
             }
 
             if (isActive && currentByteOffset >= pcmData.size) {
-                // Allow final buffered frames to drain smoothly before resetting state
-                delay(180)
+                // Flush clean silence through the AudioTrack hardware buffer to avoid end-of-playback clicks/buzz
+                val silencePad = ByteArray(minBuffer.coerceAtLeast(4096))
+                runCatching { track.write(silencePad, 0, silencePad.size) }
+                val drainWaitMs = ((silencePad.size * 1000L) / (sampleRate * 2L)).coerceIn(100L, 260L)
+                delay(drainWaitMs)
                 currentByteOffset = 0
                 _state.update { it.copy(isPlaying = false, positionMs = 0L) }
             }
 
             runCatching {
+                track.pause()
+                track.flush()
                 track.stop()
                 track.release()
             }
@@ -165,6 +171,8 @@ class PcmAudioPlayer {
     private fun stopInternal(clearAudio: Boolean) {
         playbackJob?.cancel()
         runCatching {
+            audioTrack?.pause()
+            audioTrack?.flush()
             audioTrack?.stop()
             audioTrack?.release()
         }

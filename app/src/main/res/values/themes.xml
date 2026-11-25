@@ -1,3 +1,5 @@
 <resources>
-    <style name="Theme.SuaraStudio" parent="android:Theme.Material.Light.NoActionBar" />
+    <style name="Theme.SuaraStudio" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#EDE9FE</item>
+    </style>
 </resources>

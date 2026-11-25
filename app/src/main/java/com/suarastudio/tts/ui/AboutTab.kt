@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -30,9 +31,11 @@ import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Code
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Surface
@@ -60,11 +63,58 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.suarastudio.tts.R
+import com.suarastudio.tts.data.UserSettings
+
+fun resolveGeminiAccountDisplay(
+    uiState: TtsUiState,
+    settings: UserSettings
+): Pair<String, String> {
+    val key = settings.apiKey.trim()
+    if (key.isEmpty()) {
+        return "Belum Terhubung" to "API Key belum diisi di Pengaturan"
+    }
+    if (uiState.isApiConnected == false) {
+        return "Terputus / Tidak Valid" to "Periksa API Key atau koneksi internet"
+    }
+
+    val jenisGemini = uiState.detectedGeminiSummary.ifBlank {
+        when {
+            settings.modelId.contains("3.8", ignoreCase = true) -> "Gemini 3.8 TTS"
+            settings.modelId.contains("2.5", ignoreCase = true) -> "Gemini 2.5 TTS"
+            else -> settings.modelId
+        }
+    }
+
+    val tierNote = when {
+        settings.lastQuotaAlert.contains("Free Tier", ignoreCase = true) ||
+            settings.lastQuotaAlert.contains("free_tier", ignoreCase = true) ->
+            "Free Tier (Terdeteksi dari API)"
+        settings.dailyRequestLimit <= 20 -> "Free Tier (Batas 20 req/hari)"
+        settings.dailyRequestLimit >= 200 -> "Paid / Tier 1+ (${settings.dailyRequestLimit} req/hari)"
+        key.startsWith("AQ.") -> "Aktif · AI Studio Key (AQ)"
+        key.startsWith("AIza") -> "Aktif · Google Cloud Key (AIza)"
+        else -> "Aktif · Gemini API Key"
+    }
+
+    return jenisGemini to tierNote
+}
 
 @Composable
-fun AboutTab(modifier: Modifier = Modifier) {
+fun AboutTab(
+    uiState: TtsUiState,
+    settings: UserSettings,
+    modifier: Modifier = Modifier
+) {
     val uriHandler = LocalUriHandler.current
     var showDonateModal by remember { mutableStateOf(false) }
+
+    val (jenisGemini, tierStatus) = resolveGeminiAccountDisplay(uiState, settings)
+    val (statusDotColor, statusHeadline) = when {
+        settings.apiKey.isBlank() -> Color(0xFFDC2626) to "Belum Diisi"
+        uiState.isApiConnected == true -> Color(0xFF16A34A) to "Terhubung (Connected)"
+        uiState.isApiConnected == false -> Color(0xFFDC2626) to "Terputus (Disconnected)"
+        else -> MaterialTheme.colorScheme.outline to "Memeriksa API Key..."
+    }
 
     Column(
         modifier = modifier
@@ -96,6 +146,88 @@ fun AboutTab(modifier: Modifier = Modifier) {
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                }
+            }
+        }
+
+        // Status & Jenis Gemini Akun dari API Key (di atas Informasi Developer)
+        OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Status & Jenis Gemini Akun",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Surface(
+                        color = statusDotColor.copy(alpha = 0.12f),
+                        shape = CircleShape
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .clip(CircleShape)
+                                    .background(statusDotColor)
+                            )
+                            Text(
+                                text = statusHeadline,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = statusDotColor
+                            )
+                        }
+                    }
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = "Jenis Gemini: $jenisGemini",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold)
+                    )
+                    Text(
+                        text = "Tier / Paket API Key: $tierStatus",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (uiState.detectedTtsModels.isNotEmpty()) {
+                        Text(
+                            text = "Akses Model TTS (${uiState.detectedTtsModels.size}): ${uiState.detectedTtsModels.joinToString(", ")}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    } else if (settings.apiKey.isNotBlank()) {
+                        Text(
+                            text = "Model aktif: ${settings.modelId}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // Pure Monet button with Gemini sparkle logo
+                Button(
+                    onClick = { uriHandler.openUri("https://aistudio.google.com/billing") },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    GeminiSparkleVector(modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Upgrade Gemini", maxLines = 1)
                 }
             }
         }
@@ -236,6 +368,25 @@ fun AboutTab(modifier: Modifier = Modifier) {
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun GeminiSparkleVector(modifier: Modifier = Modifier) {
+    val tint = LocalContentColor.current
+    Canvas(modifier = modifier) {
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        val r = size.minDimension * 0.45f
+        val path = Path().apply {
+            moveTo(cx, cy - r)
+            cubicTo(cx, cy - r * 0.38f, cx + r * 0.38f, cy, cx + r, cy)
+            cubicTo(cx + r * 0.38f, cy, cx, cy + r * 0.38f, cx, cy + r)
+            cubicTo(cx, cy + r * 0.38f, cx - r * 0.38f, cy, cx - r, cy)
+            cubicTo(cx - r * 0.38f, cy, cx, cy - r * 0.38f, cx, cy - r)
+            close()
+        }
+        drawPath(path = path, color = tint)
     }
 }
 
